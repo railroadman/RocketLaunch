@@ -1,7 +1,8 @@
 import { describe, it, expect, beforeAll } from 'vitest';
-import { atmosphere, R, MU, PAD, LANDING, orbitOf, forces, earthFixed } from '../src/sim/physics';
+import { atmosphere, R, MU, PAD, LANDING, orbitOf, forces, earthFixed, G0 } from '../src/sim/physics';
 import { calculateMission, CONFIG } from '../src/sim/mission';
-import { len, sub } from '../src/sim/math';
+import { len, sub, dot, norm } from '../src/sim/math';
+import { calculateDisposal } from '../src/sim/disposal';
 import { frameAt, MissionPlayer } from '../src/sim/player';
 import type { MissionData } from '../src/sim/types';
 import { plumeProfile } from '../src/scene/plume';
@@ -81,9 +82,11 @@ describe('scientific flight model',()=>{
 });
 
 describe('mission playback',()=>{
-  it('covers the complete mission in 270 seconds with one shared mission clock',()=>{
+  it('covers launch in 270 seconds plus a short 20-second disposal finale',()=>{
     const player=new MissionPlayer(mission);player.playing=true;for(let i=0;i<2700;i++)player.tick(.1);
-    expect(player.time).toBeCloseTo(mission.end,3);expect(player.playing).toBe(false);expect(player.presentationTime).toBeCloseTo(270,4);
+    expect(player.time).toBeCloseTo(mission.disposal.start,3);
+    for(let i=0;i<201;i++)player.tick(.1);
+    expect(player.time).toBeCloseTo(mission.end,3);expect(player.playing).toBe(false);expect(player.presentationTime).toBeCloseTo(290,4);
   });
   it('preserves critical windows at real-time speed and pauses deterministically',()=>{
     const player=new MissionPlayer(mission);player.playing=true;player.seek(-15);player.tick(1);expect(player.time).toBeCloseTo(-14,5);
@@ -99,5 +102,51 @@ describe('mission playback',()=>{
   });
   it('manual 5x speed advances a common simulation time',()=>{
     const player=new MissionPlayer(mission);player.mode=5;player.playing=true;player.seek(200);player.tick(2);expect(player.time).toBe(210);
+  });
+});
+
+describe('upper-stage disposal',()=>{
+  it('uses a retrograde, fuel-consuming burn to lower perigee',()=>{
+    const d=mission.disposal,before=frameAt(mission,d.burnStart).upper,after=frameAt(mission,d.burnEnd).upper;
+    expect(dot(before.direction,norm(before.velocity))).toBeLessThan(-.99);
+    expect(after.fuel).toBeLessThan(before.fuel);expect(after.fuel).toBeGreaterThan(0);
+    expect(d.deltaV).toBeGreaterThan(100);expect(d.deltaV).toBeLessThan(125);
+    expect(348*G0*Math.log(before.mass/after.mass)).toBeCloseTo(d.deltaV,0);
+    expect(d.perigee).toBeLessThan(-60000);
+  });
+  it('orders disposal events and marks each phase at its actual event time',()=>{
+    const d=mission.disposal;
+    expect(d.start).toBeGreaterThan(mission.deployment+90);
+    expect(d.burnStart).toBeLessThan(d.burnEnd);expect(d.burnEnd).toBeLessThan(d.entry);
+    expect(d.entry).toBeLessThan(d.breakup);expect(d.breakup).toBeLessThan(d.impact);
+    for(const [time,phase] of [[d.burnStart,'deorbit'],[d.entry,'reentry'],[d.breakup,'breakup'],[d.impact,'disposed']] as const)expect(frameAt(mission,time).upper.phase).toBe(phase);
+    expect(frameAt(mission,d.entry).upper.altitude).toBeCloseTo(120000,-2);
+    expect(frameAt(mission,d.breakup).upper.altitude).toBeCloseTo(70000,-2);
+  });
+  it('keeps the satellites in orbit while the stage descends and is destroyed',()=>{
+    const final=frameAt(mission,mission.end);
+    for(const satellite of final.satellites){expect(satellite.released).toBe(true);expect(orbitOf(satellite.position,satellite.velocity).perigee).toBeGreaterThan(270000);}
+    expect(final.upper.phase).toBe('disposed');expect(final.upper.altitude).toBe(0);
+    expect(mission.disposal.longitude).toBeGreaterThan(60);expect(mission.disposal.longitude).toBeLessThan(75);
+    expect(Math.abs(mission.disposal.latitude)).toBeLessThan(10);
+  });
+  it('keeps the recovered booster fixed for the extended mission',()=>{
+    for(const time of [1600.137,2200.49,mission.end-.13]){
+      const frame=frameAt(mission,time);
+      expect(Math.abs(len(sub(earthFixed(frame.booster.position,time),LANDING))-mission.landingError)).toBeLessThan(.003);
+    }
+  });
+  it('seeks the finale on the shared presentation timeline in both directions',()=>{
+    const player=new MissionPlayer(mission);
+    for(const time of [mission.disposal.burnStart,mission.disposal.breakup,mission.disposal.impact]){
+      player.seekPresentation(player.presentationAt(time));expect(player.time).toBeCloseTo(time,6);
+    }
+    player.seek(mission.disposal.impact);player.seek(mission.disposal.entry);const frame=player.frame;
+    player.seek(0);player.seek(mission.disposal.entry);expect(player.frame).toEqual(frame);
+    expect(player.presentationAt(mission.end)-player.presentationAt(mission.disposal.start)).toBeCloseTo(20,5);
+  });
+  it('rejects a disposal burn with no propellant',()=>{
+    const state=frameAt(mission,mission.disposal.start).upper;
+    expect(()=>calculateDisposal({p:state.position,v:state.velocity,fuel:0},mission.disposal.start,CONFIG.secondDry,state.burnTime)).toThrow('Insufficient');
   });
 });

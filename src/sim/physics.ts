@@ -35,12 +35,12 @@ export function dragCoefficient(mach: number, booster = false) {
   return (booster ? 1.10 : 0.24) + 0.32 * Math.exp(-Math.pow((mach-1.1)/0.45,2));
 }
 export interface Point { p: V3; v: V3; fuel: number; }
-export interface Force { direction: V3; thrust: number; isp: number; dry: number; booster?: boolean; }
+export interface Force { direction: V3; thrust: number; isp: number; dry: number; booster?: boolean; area?: number; coefficient?: number; }
 export function forces(s: Point, f: Force) {
   const h = Math.max(0, len(s.p) - R), a = atmosphere(h);
   const relative = sub(s.v, atmosphereVelocity(s.p)), speed = len(relative);
   const q = 0.5 * a.density * speed * speed;
-  const drag = q * dragCoefficient(speed / a.sound, f.booster) * Math.PI * 1.83 ** 2;
+  const drag = q * (f.coefficient??dragCoefficient(speed / a.sound, f.booster)) * (f.area??Math.PI * 1.83 ** 2);
   const mass = f.dry + Math.max(0, s.fuel);
   const thrust = s.fuel > 0 ? f.thrust : 0;
   const applied = sub(mul(f.direction, thrust), mul(norm(relative), drag));

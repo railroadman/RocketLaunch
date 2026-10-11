@@ -17,26 +17,32 @@ export class MissionPlayer {
   playing=false;
   mode: 'auto' | number='auto';
   rate=1;
-  readonly duration=270;
+  readonly duration=290;
   private clock=0;
   private marks:{mission:number;screen:number}[]=[];
   constructor(public readonly data:MissionData){
-    // Preserve critical windows at 1x. Distribute the remaining footage to a 4:30 cut.
+    // Keep the original launch/deployment cut at 4:30, then a concise 20s disposal.
+    const ascentEnd=data.disposal.start;
     const karman=data.events.find(e=>e.id==='karman')!.time;
     const windows=[[-30,15],[data.separation-3,data.separation+10],[karman-6,karman+7],[data.touchdown-27,data.touchdown+7],[data.deployment-3,data.deployment+17]];
-    const knots=[-30,data.end,...windows.flat()].filter(t=>t>=-30&&t<=data.end).sort((a,b)=>a-b);
+    const knots=[-30,ascentEnd,...windows.flat()].filter(t=>t>=-30&&t<=ascentEnd).sort((a,b)=>a-b);
     const unique=[...new Set(knots)];
     const intervals=unique.slice(1).map((end,i)=>{const begin=unique[i],mid=(begin+end)/2;return{begin,end,critical:windows.some(([a,b])=>mid>=a&&mid<=b)};});
     const critical=intervals.filter(x=>x.critical).reduce((sum,x)=>sum+x.end-x.begin,0);
     const other=intervals.filter(x=>!x.critical).reduce((sum,x)=>sum+x.end-x.begin,0);
     let screen=0;this.marks=[{mission:-30,screen:0}];
-    for(const interval of intervals){screen+=(interval.end-interval.begin)*(interval.critical?1:(this.duration-critical)/other);this.marks.push({mission:interval.end,screen});}
+    for(const interval of intervals){screen+=(interval.end-interval.begin)*(interval.critical?1:(270-critical)/other);this.marks.push({mission:interval.end,screen});}
+    const d=data.disposal;
+    const finale=[[d.burnStart-5,271],[d.burnEnd+5,275],[d.entry,278],[d.breakup,284],[d.impact,288],[data.end,290]];
+    for(const [mission,screen] of finale)this.marks.push({mission,screen});
   }
   private convert(value:number,from:'mission'|'screen',to:'mission'|'screen'){
     for(let i=1;i<this.marks.length;i++){const a=this.marks[i-1],b=this.marks[i];if(value<=b[from])return mix(a[to],b[to],clamp((value-a[from])/(b[from]-a[from])));}
     return this.marks.at(-1)![to];
   }
   seek(time:number){this.time=clamp(time,-30,this.data.end);this.clock=this.convert(this.time,'mission','screen');}
+  presentationAt(time:number){return this.convert(clamp(time,-30,this.data.end),'mission','screen');}
+  seekPresentation(time:number){this.seek(this.convert(clamp(time,0,this.duration),'screen','mission'));}
   reset(){this.seek(-30);this.playing=false;}
   tick(dt:number){
     if(!this.playing)return;

@@ -1,3 +1,4 @@
+import { calculateDisposal } from './disposal';
 import { add, sub, mul, dot, cross, norm, len, clamp, mix, smooth, type V3 } from './math';
 import { R, MU, G0, PAD, LANDING, AXIS, atmosphereVelocity, atmosphere, forces, integrate, orbitOf, earthFixed, inertial, type Point, type Force } from './physics';
 import type { MissionData, MissionEvent, MissionFrame, VehicleState, Phase, SatelliteState } from './types';
@@ -161,9 +162,15 @@ export function calculateMission():MissionData {
       (upper?upperSamples:stackSamples).push({time:t,state});last=t;
     }
   });
+  const lookup=(samples:{time:number;state:VehicleState}[],t:number)=>{
+    let lo=0,hi=samples.length-1;while(lo<hi){const mid=Math.ceil((lo+hi)/2);if(samples[mid].time<=t)lo=mid;else hi=mid-1;}
+    const a=samples[lo],b=samples[Math.min(lo+1,samples.length-1)];
+    return interpolateVehicle(a.state,b.state,clamp((t-a.time)/Math.max(b.time-a.time,1e-6)));
+  };
   const orbit=orbitOf(flown.upper.p,flown.upper.v);
   const booster=simulateBooster(flown.booster,CONFIG.dt);
-  const deployment=flown.end+115,end=deployment+95;
+  const deployment=flown.end+115,disposalStart=deployment+95;
+  let end=disposalStart;
   const spacecraft:(Point|null)[]=Array.from({length:CONFIG.satelliteCount},()=>null);
   const satelliteSamples:{time:number;states:SatelliteState[]}[]=[];
   let upper=flown.upper;
@@ -182,10 +189,27 @@ export function calculateMission():MissionData {
     for(let i=0;i<spacecraft.length;i++)if(spacecraft[i])spacecraft[i]=integrate(spacecraft[i]!,zero(CONFIG.payload/8,norm(spacecraft[i]!.p)),CONFIG.dt);
     upper=integrate(upper,f,CONFIG.dt);
   }
-  const lookup=(samples:{time:number;state:VehicleState}[],t:number)=>{
-    let lo=0,hi=samples.length-1;while(lo<hi){const mid=Math.ceil((lo+hi)/2);if(samples[mid].time<=t)lo=mid;else hi=mid-1;}
-    const a=samples[lo],b=samples[Math.min(lo+1,samples.length-1)];
-    return interpolateVehicle(a.state,b.state,clamp((t-a.time)/Math.max(b.time-a.time,1e-6)));
+  const disposalState=lookup(upperSamples,disposalStart);
+  const disposal=calculateDisposal({p:disposalState.position,v:disposalState.velocity,fuel:disposalState.fuel},disposalStart,CONFIG.secondDry,upperBurn);
+  end=disposal.info.end;
+  while(upperSamples.at(-1)!.time>=disposalStart)upperSamples.pop();
+  upperSamples.push(...disposal.samples);
+  let tailIndex=0;
+  while(tailIndex<satelliteSamples.length-1&&satelliteSamples[tailIndex+1].time<=disposalStart)tailIndex++;
+  const tailA=satelliteSamples[tailIndex],tailB=satelliteSamples[Math.min(tailIndex+1,satelliteSamples.length-1)];
+  const tailK=clamp((disposalStart-tailA.time)/Math.max(tailB.time-tailA.time,1e-6));
+  tailA.states.forEach((state,i)=>spacecraft[i]={p:interpolateVector(state.position,tailB.states[i].position,tailK),v:interpolateVector(state.velocity,tailB.states[i].velocity,tailK),fuel:0});
+  while(satelliteSamples.at(-1)!.time>=disposalStart)satelliteSamples.pop();
+  let lastSatellite=-Infinity;
+  for(let t=disposalStart;t<=end+1;t+=.2){
+    if(t-lastSatellite>=1-1e-7){satelliteSamples.push({time:t,states:spacecraft.map(s=>({released:true,position:[...s!.p],velocity:[...s!.v]}))});lastSatellite=t;}
+    for(let i=0;i<spacecraft.length;i++)spacecraft[i]=integrate(spacecraft[i]!,zero(CONFIG.payload/8,norm(spacecraft[i]!.p)),.2);
+  }
+  const contactSample=booster.states.at(-1)!;
+  const contactFixed=earthFixed(contactSample.state.position,contactSample.time);
+  const landed=(time:number):VehicleState=>{
+    const position=inertial(contactFixed,time);
+    return {...contactSample.state,position,velocity:atmosphereVelocity(position),direction:norm(position)};
   };
   const frames:MissionFrame[]=[];
   const pad=snapshot(initial(),zero(CONFIG.firstDry+CONFIG.secondDry+CONFIG.secondFuel+CONFIG.payload+CONFIG.fairingMass,[0,1,0]),'countdown',0,0);
@@ -196,7 +220,10 @@ export function calculateMission():MissionData {
     frames.push({time:t,stack:state,upper:attachedUpper(state),booster:attachedBooster(state),satellites:[]});
   }
   let satelliteIndex=0;
-  for(let t=0;t<=end;t+=CONFIG.sample){
+  const frameTimes:number[]=[];
+  for(let t=0;t<disposalStart;t+=CONFIG.sample)frameTimes.push(t);
+  frameTimes.push(...disposal.samples.map(sample=>sample.time));
+  for(const t of frameTimes){
     while(satelliteIndex<satelliteSamples.length-1&&satelliteSamples[satelliteIndex+1].time<=t)satelliteIndex++;
     const a=satelliteSamples[satelliteIndex],b=satelliteSamples[Math.min(satelliteIndex+1,satelliteSamples.length-1)];
     const k=clamp((t-a.time)/Math.max(b.time-a.time,1e-6));
@@ -205,7 +232,7 @@ export function calculateMission():MissionData {
       return state.released&&next.released?{released:true,position:interpolateVector(state.position,next.position,k),velocity:interpolateVector(state.velocity,next.velocity,k)}:state;
     }):[];
     const stack=lookup(stackSamples,t);
-    frames.push({time:t,stack,booster:t<CONFIG.separation?attachedBooster(stack):lookup(booster.states,t),upper:t<CONFIG.separation?attachedUpper(stack):lookup(upperSamples,t),satellites});
+    frames.push({time:t,stack,booster:t<CONFIG.separation?attachedBooster(stack):(t>=booster.touchdown?landed(t):lookup(booster.states,t)),upper:t<CONFIG.separation?attachedUpper(stack):lookup(upperSamples,t),satellites});
   }
   const maxFrame=frames.reduce((a,b)=>b.stack.q>a.stack.q&&b.time<CONFIG.separation?b:a,frames[0]);
   const crossing=frames.findIndex(frame=>frame.time>=0&&frame.upper.altitude>=100000);
@@ -225,9 +252,11 @@ export function calculateMission():MissionData {
     ...booster.events,
     {id:'seco',time:flown.end,label:'SECO / ORBIT INSERTION',detail:'Выключение второй ступени. Проверка параметров начальной орбиты.',vehicle:'upper'},
     {id:'deploy',time:deployment,label:'STARLINK DEPLOYMENT',detail:'Отделение пакета из восьми спутников. Начало расхождения.',vehicle:'upper'},
-    {id:'complete',time:end-12,label:'MISSION COMPLETE',detail:'Полезная нагрузка на орбите. Итоги расчётной миссии.',vehicle:'upper'},
+    {id:'payload-complete',time:disposalStart-12,label:'PAYLOAD MISSION COMPLETE',detail:'Спутники остаются на орбите. Дальше показана отдельная утилизация второй ступени.',vehicle:'upper'},
+    ...(['deorbit','reentry','breakup','ocean'] as const).map((id,i)=>({id,time:[disposal.info.burnStart,disposal.info.entry,disposal.info.breakup,disposal.info.impact][i],label:id,detail:'Учебный сценарий утилизации второй ступени.',vehicle:'upper' as const})),
+    {id:'complete',time:end-2,label:'MISSION COMPLETE',detail:'Спутники на орбите, первая ступень возвращена, утилизация второй ступени завершена.',vehicle:'upper'},
   ] satisfies MissionEvent[]).sort((a,b)=>a.time-b.time);
   return {frames,events,orbit,separation:CONFIG.separation,fairing:CONFIG.fairing,seco:flown.end,touchdown:booster.touchdown,deployment,end,
-    maxQ:maxFrame.stack.q,landingError:booster.error,landingSpeed:booster.speed,
+    disposal:disposal.info,maxQ:maxFrame.stack.q,landingError:booster.error,landingSpeed:booster.speed,
     parameters:{...CONFIG,firstTilt:params[0],upperEndPitch:params[1],upperBurn:params[2],solverError:Math.hypot(...solved.residual)}};
 }

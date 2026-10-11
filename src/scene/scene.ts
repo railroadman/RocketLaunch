@@ -1,3 +1,4 @@
+import { DisposalEffects } from './disposal';
 import * as THREE from 'three';
 import { EffectComposer } from 'three/addons/postprocessing/EffectComposer.js';
 import { RenderPass } from 'three/addons/postprocessing/RenderPass.js';
@@ -7,8 +8,8 @@ import { OutputPass } from 'three/addons/postprocessing/OutputPass.js';
 import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
 import { createBooster, createUpper, createPad, createLandingPad, volume, type RocketModel } from './models';
 import { skyVertex, skyFragment, earthVertex, earthFragment, atmosphereVertex, atmosphereFragment, groundVertex, groundFragment, cinematicShader } from './shaders';
-import { R, PAD, LANDING, earthFixed, localPosition } from '../sim/physics';
-import { clamp, smooth, mix, mul } from '../sim/math';
+import { R, PAD, LANDING, earthFixed, localPosition, atmosphereVelocity } from '../sim/physics';
+import { clamp, smooth, mix, mul, sub } from '../sim/math';
 import type { MissionData, MissionFrame, VehicleId, VehicleState } from '../sim/types';
 import { plumeProfile } from './plume';
 
@@ -37,6 +38,7 @@ export class FlightScene {
   private clouds:THREE.Group;
   private landingDust=volume(true);
   private trail:THREE.Line;
+  readonly disposalEffects:DisposalEffects;
   private origin=new THREE.Vector3();
   private cameraFocus=new THREE.Vector3();
   private previousShot='';
@@ -50,6 +52,7 @@ export class FlightScene {
   override:VehicleId|null=null;
   currentVehicle:VehicleId='stack';
   shotLabel='PAD / CAMERA 01';
+  shotLabelKey='shot.pad';
   fps=60;
 
   constructor(canvas:HTMLCanvasElement,private data:MissionData){
@@ -59,6 +62,8 @@ export class FlightScene {
     this.renderer.shadowMap.enabled=true;this.renderer.shadowMap.type=THREE.PCFSoftShadowMap;
     this.renderer.info.autoReset=false;
     this.scene.add(this.root);this.root.add(this.booster.group,this.upper.group,this.pad.group,this.landingPad);
+    this.disposalEffects=new DisposalEffects(data);this.root.add(this.disposalEffects.group);
+    this.root.add(...this.upper.satellites!);
     this.landingPad.position.copy(vec(LANDING)).sub(vec(PAD));
     const sun=new THREE.Vector3(-.85,.085,-.50).normalize();
     this.sky=new THREE.Mesh(new THREE.SphereGeometry(8_000_000,32,20),new THREE.ShaderMaterial({vertexShader:skyVertex,fragmentShader:skyFragment,uniforms:{uAltitude:{value:0},uSun:{value:sun}},side:THREE.BackSide,depthWrite:false,depthTest:false}));this.sky.renderOrder=-100;this.sky.frustumCulled=false;this.scene.add(this.sky);
@@ -129,6 +134,16 @@ export class FlightScene {
     else{vehicle='upper';id='final';label='ORBIT / MISSION OVERVIEW';const f=smooth((t-d.deployment-40)/55);offset.set(mix(90,2900,f),mix(38,900,f),mix(105,3500,f));focus.y=55;fov=46;}
     const karman=d.events.find(e=>e.id==='karman')!.time;
     if(t>=karman-8&&t<=Math.min(karman+10,d.fairing-2)){vehicle='upper';id='karman';label='100 KM / KÁRMÁN LINE · EXPANDING PLUME';offset.set(230,75,285);focus.y=-12;fov=50;}
+    if(t>=d.disposal.start){
+      vehicle='upper';id=frame.upper.phase==='deorbit'?'deorbit':frame.upper.phase==='reentry'?'reentry':frame.upper.phase==='breakup'?'breakup':frame.upper.phase==='disposed'?'ocean':'disposalCoast';
+      label=`UPPER STAGE / ${id.toUpperCase()}`;
+      const radial=vec(earthFixed(frame.upper.position,t)).normalize();
+      const along=vec(earthFixed(sub(frame.upper.velocity,atmosphereVelocity(frame.upper.position)),t)).normalize();
+      const side=new THREE.Vector3().crossVectors(along,radial).normalize();
+      const distance=id==='breakup'?230:id==='ocean'?260:135;
+      offset.copy(radial).multiplyScalar(id==='ocean'?140:45).addScaledVector(side,distance).addScaledVector(along,-distance*.5);
+      focus.y=frame.upper.phase==='disposed'?0:57;fov=48;
+    }
     if(this.override&&t>=d.separation){vehicle=this.override;id=`manual-${vehicle}`;label=vehicle==='booster'?'BOOSTER / TRACKING':'UPPER STAGE / TRACKING';offset.set(110,20,145);focus.y=vehicle==='booster'?23:55;}
     return {id,label,vehicle,offset,focus,fov};
   }
@@ -154,20 +169,24 @@ export class FlightScene {
   render(frame:MissionFrame,dt:number){
     const t=frame.time,shot=this.shot(frame),s=frame[shot.vehicle],target=vec(localPosition(s.position,t));
     this.currentVehicle=shot.vehicle;this.shotLabel=shot.label;
+    this.shotLabelKey=this.manual?'shot.free':shot.id.startsWith('cruise-')?`shot.cruise${shot.vehicle==='upper'?'Upper':'Booster'}`:shot.id.startsWith('manual-')?`shot.manual${shot.vehicle==='upper'?'Upper':'Booster'}`:`shot.${shot.id}`;
     const oldOrigin=this.origin.clone();this.origin.copy(target);this.root.position.copy(target).negate();
     if(this.manual){const shift=oldOrigin.sub(this.origin);this.camera.position.add(shift);this.controls.target.add(shift);}
     const base=t<this.data.separation?6:6*(1-smooth((t-this.data.separation)/20));
     this.updateRocket(this.booster,t<this.data.separation?frame.stack:frame.booster,t,base,'booster');
     this.updateRocket(this.upper,frame.upper,t,50,'upper');
+    this.upper.group.visible=frame.upper.phase!=='breakup'&&frame.upper.phase!=='disposed';
+    const reentryAnchor=this.upper.group.position.clone().addScaledVector(vec(earthFixed(frame.upper.direction,t)),6.5);
+    this.disposalEffects.update(t,frame.upper,reentryAnchor,shot.vehicle==='upper');
+    if(t>=this.data.disposal.start&&shot.vehicle==='upper')this.camera.up.copy(vec(earthFixed(s.position,t)).normalize());else this.camera.up.copy(UP);
     this.upper.fairing!.forEach((half,i)=>{const elapsed=Math.max(0,t-this.data.fairing);half.visible=elapsed<45;half.position.set((i===0?1:-1)*elapsed*1.7,-elapsed*.15,0);half.rotation.z=(i===0?-1:1)*elapsed*.025;});
     const release=Math.max(0,t-this.data.deployment);
     this.upper.satellites!.forEach((sat,i)=>{
-      const elapsed=Math.max(0,release-i*.5);sat.position.set(elapsed*.6*Math.sin(i*1.4),i*.3+elapsed*(1.2+i*.18),elapsed*.9*Math.cos(i*1.2));
-      const spacecraft=frame.satellites[i];
-      if(spacecraft?.released){
-        sat.position.copy(vec(localPosition(spacecraft.position,t))).sub(this.upper.group.position).applyQuaternion(this.upper.group.quaternion.clone().invert()).sub(this.upper.payload!.position);
-      }else sat.position.set(0,i*.3,0);
+      const elapsed=Math.max(0,release-i*.5),spacecraft=frame.satellites[i];
+      if(spacecraft?.released)sat.position.copy(vec(localPosition(spacecraft.position,t)));
+      else sat.position.set(0,12.4+i*.3,0).applyQuaternion(this.upper.group.quaternion).add(this.upper.group.position);
       sat.rotation.set(.85+elapsed*.006*(i-3),elapsed*.015,.3+elapsed*.009*(i-2));
+      if(!spacecraft?.released)sat.quaternion.premultiply(this.upper.group.quaternion);
       const panel=sat.getObjectByName('solar')!,folded=sat.getObjectByName('folded')!;
       panel.visible=elapsed>12;folded.visible=elapsed<=12;const extend=smooth((elapsed-12)/10);panel.scale.z=Math.max(.02,extend);panel.position.z=.6+2.7*extend;
     });
@@ -179,8 +198,8 @@ export class FlightScene {
     const landingPower=frame.booster.altitude<120&&t>this.data.separation?clamp(frame.booster.thrust/850000):0;
     this.landingDust.visible=landingPower>0||t>=this.data.touchdown&&t<this.data.touchdown+15;
     const lm=this.landingDust.material as THREE.ShaderMaterial;lm.uniforms.uTime.value=t*.2;lm.uniforms.uPower.value=landingPower*.5+(t>this.data.touchdown?Math.max(0,1-(t-this.data.touchdown)/15)*.3:0);
-    this.ground.visible=s.altitude<100000;this.pad.group.visible=s.altitude<80000;this.landingPad.visible=s.altitude<80000;
-    this.planet.visible=s.altitude>12000;this.atmosphere.visible=s.altitude>20000;
+    this.ground.visible=s.altitude<100000&&(t<this.data.disposal.start||shot.vehicle==='booster');this.pad.group.visible=s.altitude<80000;this.landingPad.visible=s.altitude<80000;
+    this.planet.visible=s.altitude>12000||t>=this.data.disposal.start&&shot.vehicle==='upper';this.atmosphere.visible=s.altitude>20000;
     this.sky.position.copy(this.camera.position);(this.sky.material as THREE.ShaderMaterial).uniforms.uAltitude.value=s.altitude;
     this.stars.position.copy(this.camera.position);(this.stars.material as THREE.PointsMaterial).opacity=smooth((s.altitude-35000)/85000)*.7;
     const atmosphereColor=new THREE.Color().setRGB(mix(.26,.001,clamp(s.altitude/100000)),mix(.16,.003,clamp(s.altitude/100000)),mix(.13,.008,clamp(s.altitude/100000)));

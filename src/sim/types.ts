@@ -1,7 +1,7 @@
 import type { V3 } from './math';
 
 export type VehicleId = 'stack' | 'booster' | 'upper';
-export type Phase = 'countdown' | 'ascent' | 'coast' | 'boostback' | 'entry' | 'landing' | 'landed' | 'insertion' | 'orbit' | 'deployment';
+export type Phase = 'countdown' | 'ascent' | 'coast' | 'boostback' | 'entry' | 'landing' | 'landed' | 'insertion' | 'orbit' | 'deployment' | 'disposal-coast' | 'deorbit' | 'reentry' | 'breakup' | 'disposed';
 export interface VehicleState {
   position: V3;
   velocity: V3;
@@ -53,4 +53,19 @@ export interface MissionData {
   landingError: number;
   landingSpeed: number;
   parameters: Record<string, number>;
+  disposal: DisposalInfo;
+}
+export interface DisposalInfo {
+  start: number;
+  burnStart: number;
+  burnEnd: number;
+  entry: number;
+  breakup: number;
+  impact: number;
+  end: number;
+  perigee: number;
+  deltaV: number;
+  impactFixed: V3;
+  latitude: number;
+  longitude: number;
 }
