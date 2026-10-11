@@ -1,0 +1,32 @@
+node_modules/
+dist/
+artifacts/
+*.log
+.DS_Store
+
+# Playwright
+test-results/
+playwright-report/
+blob-report/
+playwright/.cache/
+
+# Vitest coverage
+coverage/
+
+# Vite / TypeScript cache
+.vite/
+*.local
+*.tsbuildinfo
+
+# Env / secrets
+.env
+.env.*
+!.env.example
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+Thumbs.db
+desktop.ini
